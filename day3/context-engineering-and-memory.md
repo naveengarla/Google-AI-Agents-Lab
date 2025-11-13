@@ -17,11 +17,24 @@ A context engineer must manage three types of data:
 
 A primary challenge is **Context Rot**, where the context window becomes too full and noisy, degrading the model's ability to reason. Context engineering fights this with **dynamic history mutation**—smart strategies like summarization and selective pruning to trim the conversational fat and keep the signal strong.
 
-This process follows a constant four-step cycle for every turn:
-1.  **Fetch Context:** Retrieve relevant memories, RAG documents, and other necessary data.
-2.  **Prepare Context:** Assemble the full prompt string. This step is on the "hot path," meaning it blocks the response and is critical for performance.
-3.  **Invoke LLM & Tools:** Send the prepared context to the model and execute any required functions.
-4.  **Upload Context:** Save any new insights or facts learned during the turn to persistent storage. This step must be done **asynchronously** in the background to avoid user-facing latency.
+This process follows a constant four-step cycle for every turn, with the final step running asynchronously to ensure a responsive user experience.
+
+```mermaid
+graph TD
+    subgraph "Turn Cycle"
+        A["1. Fetch Context <br/>- Memories<br/>- RAG Docs"] --> B{"2. Prepare Context <br/>(Assemble Prompt)"};
+        B --> C["3. Invoke LLM & Tools"];
+        C --> D["User Response"];
+        C --> E(("4. Upload Context"));
+    end
+    subgraph "Background Process"
+        E -- "Asynchronously" --> F["Update Persistent Storage"];
+    end
+    
+    style B fill:#f9f,stroke:#333,stroke-width:2px
+    style C fill:#ccf,stroke:#333,stroke-width:2px
+    style E fill:#bbf,stroke:#333,stroke-width:2px
+```
 
 ### Part 2: Sessions - The Conversational Workbench
 
@@ -29,11 +42,27 @@ If long-term memory is the organized filing cabinet, the session is the messy wo
 *   **Events:** A strict, chronological log of the conversation (e.g., "User says X," "Agent calls tool Z").
 *   **State:** A structured working memory, like items in a shopping cart or the current step in a booking process.
 
-Frameworks handle sessions differently. Some use explicit, separate objects for events and state. Others, like LangGraph, use a single mutable state object. This mutability is key, as it allows for **compaction strategies**—like replacing a chunk of old messages with a summary—to be implemented directly and efficiently. In multi-agent systems, this can be handled with a **shared, unified history** for close collaboration or **separate individual histories** where agents communicate via explicit messages, preserving autonomy but losing shared context.
+In a production environment, session management has critical implications. Strict data isolation, PII reduction before storage, and TTL policies are essential.
 
-In a production environment, session management has critical implications for security and performance. Strict data isolation and access controls are table stakes, but it's also vital to perform **PII (Personally Identifiable Information) reduction** *before* data ever hits persistent logs to comply with regulations like GDPR. Policies for **TTL (Time To Live)** are needed to manage session lifespan.
+Because session data is on the hot path, performance is paramount. To prevent latency from a bloated history, compaction is essential. A sophisticated method is **recursive summarization**, where the LLM itself periodically summarizes older parts of the conversation. This process is computationally heavy and **must be executed asynchronously**.
 
-Because session data is on the hot path, performance is paramount. To prevent latency and context rot from a bloated history, compaction is essential. Simple methods include a "sliding window" (keeping the last N turns) or token-based truncation. A more sophisticated and powerful method is **recursive summarization**, where the LLM itself is periodically used to summarize older parts of the conversation. This process is computationally heavy and **must be executed asynchronously** in the background to avoid blocking the user's next response.
+```mermaid
+graph TD
+    subgraph "Main Conversation Flow"
+        A["Recent Turns<br/>(Verbatim)"]
+    end
+
+    subgraph "Background Compaction Process"
+        B("Older Conversation Chunk") -- "Summarize this" --> C{"LLM"};
+        C -- "Here is a concise summary" --> D("Generated Summary");
+        D -- "Replaces original chunk" --> E["Compacted History <br/>(Summary + Recent Turns)"];
+    end
+
+    E -- "Used in next turn" --> A;
+
+    style B fill:#f9f,stroke:#333,stroke-width:2px
+    style D fill:#bbf,stroke:#333,stroke-width:2px
+```
 
 ### Part 3: Memory - The Long-Term Filing Cabinet
 
@@ -42,29 +71,61 @@ While a session is temporary, memory provides long-term persistence and personal
 > RAG is the research librarian, making the agent knowledgeable about the world with static facts. Memory is the personal assistant, making the agent knowledgeable about *you* with dynamic, user-specific information.
 
 Memory can be categorized similarly to human memory:
-*   **Declarative Memory (The "Knowing What"):** Facts, events, and figures, such as a user's favorite team or a destination for an upcoming trip.
-*   **Procedural Memory (The "Knowing How"):** Skills and workflows, like the exact sequence of tool calls needed to book a complex flight.
+*   **Declarative Memory (The "Knowing What"):** Facts, events, and figures.
+*   **Procedural Memory (The "Knowing How"):** Skills and workflows.
 
-This information is stored in a structured way, often using a hybrid of **vector databases** for semantic search ("find memories *about* X") and **knowledge graphs** for relational insights ("how is X *related to* Y and Z?").
+This information is stored using a hybrid of **vector databases** for semantic search ("find memories *about* X") and **knowledge graphs** for relational insights ("how is X *related to* Y and Z?").
 
-The creation of memory is a sophisticated, **LLM-driven ETL (Extract, Transform, Load) pipeline**:
+The creation of memory is a sophisticated, **LLM-driven ETL (Extract, Transform, Load) pipeline** that must run asynchronously.
 
-1.  **Extract:** This is not just summarization but targeted filtering. The agent identifies what is meaningful based on its purpose (a support bot cares about different details than a wellness coach), pulling specific signals from conversational noise.
-2.  **Transform (Consolidate):** This is where the real intelligence happens. The LLM compares new potential memories with existing ones and decides whether to create, update, or even delete old, conflicting, or irrelevant entries. It relies heavily on **provenance**—where a memory came from, its age, and whether it was stated or inferred—to assign a confidence score. This process mimics human forgetting, as the relevance of unused memories decays over time.
-3.  **Load:** This entire ETL process is computationally expensive and **must run asynchronously** in the background. Attempting to do it synchronously would result in unacceptable latency, making the agent feel incredibly slow.
+```mermaid
+graph LR
+    A["Conversation History"] --> B{"1. Extract <br/> Targeted Filtering"};
+    B --> C{"2. Transform <br/> Consolidate & Resolve Conflicts"};
+    C --> D["3. Load <br/> Update/Create/Delete"];
+    D --> E[("Persistent Memory<br/>Vector DB / KG")];
+
+    subgraph "Asynchronous ETL Pipeline"
+        B; C; D;
+    end
+    
+    style B fill:#f9f,stroke:#333,stroke-width:2px
+    style C fill:#ccf,stroke:#333,stroke-width:2px
+    style D fill:#bbf,stroke:#333,stroke-width:2px
+```
 
 ### Part 4: Activating and Testing Memory
 
-Once memories are stored, they must be retrieved and used effectively. A more autonomous approach is to treat **memory as a tool**, giving the agent functions like `create_memory` and `query_memory` so it can decide for itself when to save or recall information.
+Once memories are stored, they must be retrieved and used effectively. A more autonomous approach is to treat **memory as a tool**, giving the agent functions like `create_memory` and `query_memory`.
 
-Effective retrieval requires moving beyond simple vector similarity. The best approach is a **blended score** that considers:
-*   **Relevance:** The semantic similarity score.
-*   **Recency:** How recently the memory was used or created.
-*   **Importance:** The initial criticality assigned to the memory.
+Effective retrieval requires moving beyond simple vector similarity. The best approach is a **blended score** that considers multiple factors to find the most useful context.
 
-Retrieval can be **proactive** (fetching relevant memories at the start of every turn) or **reactive** (the agent decides when to query memory during its reasoning). Finally, the placement of retrieved memories in the prompt is critical. Placing them in the system instructions gives them authority but risks biasing the response if the memory is slightly wrong. Injecting them into the conversation history is less authoritative but can confuse the model and dilute the dialogue.
+```mermaid
+graph TD
+    A["User Query"] --> B{"Calculate Scores"};
+    B --> C["Relevance<br>(Semantic Similarity)"];
+    B --> D["Recency<br>(How recent?)"];
+    B --> E["Importance<br>(How critical?)"];
+    
+    subgraph "Blend Scores"
+        C; D; E;
+    end
 
-Testing this entire system requires rigor. Key metrics include **precision and recall** for memory generation, **recall@k** for retrieval, and sub-200ms **latency** for lookups. However, the ultimate measure is **end-to-end task success**: does the memory system actually help the user achieve their goal more effectively? This is often scored objectively across thousands of test cases by an "LLM judge."
+    F{"Rank Memories"}
+    C --> F;
+    D --> F;
+    E --> F;
+    
+    F --> G["Top-K Memories"];
+    G --> H(("Inject into Prompt Context"));
+    
+    style B fill:#f9f,stroke:#333,stroke-width:2px
+    style F fill:#ccf,stroke:#333,stroke-width:2px
+```
+
+Retrieval can be **proactive** (fetching memories at the start of every turn) or **reactive** (the agent decides when to query memory during its reasoning). Finally, the placement of retrieved memories in the prompt is critical, as it signals their authority to the model.
+
+Testing this entire system requires rigor, focusing on metrics for generation (precision/recall), retrieval (recall@k), latency, and the ultimate measure: **end-to-end task success**.
 
 ### Conclusion: The Path to Personalized AI
 
